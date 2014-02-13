@@ -51,15 +51,15 @@
 -export([dict_cons/3, orddict_cons/3, gb_trees_cons/3]).
 -export([gb_trees_fold/3, gb_trees_foreach/2]).
 -export([parse_arguments/3]).
+-export([all_module_attributes_with_app/1]).
 -export([all_module_attributes/1, build_acyclic_graph/3]).
 -export([now_ms/0]).
--export([const_ok/0, const/1]).
+-export([const/1]).
 -export([ntoa/1, ntoab/1]).
 -export([is_process_alive/1]).
 -export([pget/2, pget/3, pget_or_die/2, pset/3]).
 -export([format_message_queue/2]).
 -export([append_rpc_all_nodes/4]).
--export([multi_call/2]).
 -export([os_cmd/1]).
 -export([gb_sets_difference/2]).
 -export([version/0, which_applications/0]).
@@ -70,6 +70,8 @@
 -export([interval_operation/4]).
 -export([ensure_timer/4, stop_timer/2]).
 -export([get_parent/0]).
+-export([store_proc_name/1, store_proc_name/2]).
+-export([moving_average/4]).
 
 %% Horrible macro to use in guards
 -define(IS_BENIGN_EXIT(R),
@@ -209,6 +211,8 @@
         -> {'ok', {atom(), [{string(), string()}], [string()]}} |
            'no_command').
 -spec(all_module_attributes/1 :: (atom()) -> [{atom(), [term()]}]).
+-spec(all_module_attributes_with_app/1 ::
+        (atom()) -> [{atom(), atom(), [term()]}]).
 -spec(build_acyclic_graph/3 ::
         (graph_vertex_fun(), graph_edge_fun(), [{atom(), [term()]}])
         -> rabbit_types:ok_or_error2(digraph(),
@@ -217,7 +221,6 @@
                                                {bad_edge, [digraph:vertex()]}),
                                       digraph:vertex(), digraph:vertex()})).
 -spec(now_ms/0 :: () -> non_neg_integer()).
--spec(const_ok/0 :: () -> 'ok').
 -spec(const/1 :: (A) -> thunk(A)).
 -spec(ntoa/1 :: (inet:ip_address()) -> string()).
 -spec(ntoab/1 :: (inet:ip_address()) -> string()).
@@ -228,8 +231,6 @@
 -spec(pset/3 :: (term(), term(), [term()]) -> term()).
 -spec(format_message_queue/2 :: (any(), priority_queue:q()) -> term()).
 -spec(append_rpc_all_nodes/4 :: ([node()], atom(), atom(), [any()]) -> [any()]).
--spec(multi_call/2 ::
-        ([pid()], any()) -> {[{pid(), any()}], [{pid(), any()}]}).
 -spec(os_cmd/1 :: (string()) -> string()).
 -spec(gb_sets_difference/2 :: (gb_set(), gb_set()) -> gb_set()).
 -spec(version/0 :: () -> string()).
@@ -248,6 +249,10 @@
 -spec(ensure_timer/4 :: (A, non_neg_integer(), non_neg_integer(), any()) -> A).
 -spec(stop_timer/2 :: (A, non_neg_integer()) -> A).
 -spec(get_parent/0 :: () -> pid()).
+-spec(store_proc_name/2 :: (atom(), rabbit_types:proc_name()) -> ok).
+-spec(store_proc_name/1 :: (rabbit_types:proc_type_and_name()) -> ok).
+-spec(moving_average/4 :: (float(), float(), float(), float() | 'undefined')
+                          -> float()).
 -endif.
 
 %%----------------------------------------------------------------------------
@@ -850,21 +855,38 @@ module_attributes(Module) ->
             V
     end.
 
+all_module_attributes_with_app(Name) ->
+    find_module_attributes(
+      fun(App, Modules) ->
+            [{App, Module} || Module <- Modules]
+      end,
+      fun ({App, Module}, Acc) ->
+              case lists:append([Atts || {N, Atts} <- module_attributes(Module),
+                                         N =:= Name]) of
+                  []   -> Acc;
+                  Atts -> [{App, Module, Atts} | Acc]
+              end
+      end).
+
 all_module_attributes(Name) ->
-    Modules =
-        lists:usort(
-          lists:append(
-            [Modules || {App, _, _}   <- application:loaded_applications(),
-                        {ok, Modules} <- [application:get_key(App, modules)]])),
-    lists:foldl(
+    find_module_attributes(
+      fun(_App, Modules) -> Modules end,
       fun (Module, Acc) ->
               case lists:append([Atts || {N, Atts} <- module_attributes(Module),
                                          N =:= Name]) of
                   []   -> Acc;
                   Atts -> [{Module, Atts} | Acc]
               end
-      end, [], Modules).
+      end).
 
+find_module_attributes(Generator, Fold) ->
+    Targets =
+        lists:usort(
+          lists:append(
+            [Generator(App, Modules) ||
+                {App, _, _}   <- application:loaded_applications(),
+                {ok, Modules} <- [application:get_key(App, modules)]])),
+    lists:foldl(Fold, [], Targets).
 
 build_acyclic_graph(VertexFun, EdgeFun, Graph) ->
     G = digraph:new([acyclic]),
@@ -885,7 +907,6 @@ build_acyclic_graph(VertexFun, EdgeFun, Graph) ->
             {error, Reason}
     end.
 
-const_ok() -> ok.
 const(X) -> fun () -> X end.
 
 %% Format IPv4-mapped IPv6 addresses as IPv4, since they're what we see
@@ -943,31 +964,6 @@ append_rpc_all_nodes(Nodes, M, F, A) ->
                       {badrpc, _} -> [];
                       _           -> Res
                   end || Res <- ResL]).
-
-%% A simplified version of gen_server:multi_call/2 with a sane
-%% API. This is not in gen_server2 as there is no useful
-%% infrastructure there to share.
-multi_call(Pids, Req) ->
-    MonitorPids = [start_multi_call(Pid, Req) || Pid <- Pids],
-    receive_multi_call(MonitorPids, [], []).
-
-start_multi_call(Pid, Req) when is_pid(Pid) ->
-    Mref = erlang:monitor(process, Pid),
-    Pid ! {'$gen_call', {self(), Mref}, Req},
-    {Mref, Pid}.
-
-receive_multi_call([], Good, Bad) ->
-    {lists:reverse(Good), lists:reverse(Bad)};
-receive_multi_call([{Mref, Pid} | MonitorPids], Good, Bad) ->
-    receive
-        {Mref, Reply} ->
-            erlang:demonitor(Mref, [flush]),
-            receive_multi_call(MonitorPids, [{Pid, Reply} | Good], Bad);
-        {'DOWN', Mref, _, _, noconnection} ->
-            receive_multi_call(MonitorPids, Good, [{Pid, nodedown} | Bad]);
-        {'DOWN', Mref, _, _, Reason} ->
-            receive_multi_call(MonitorPids, Good, [{Pid, Reason} | Bad])
-    end.
 
 os_cmd(Command) ->
     case os:type() of
@@ -1081,6 +1077,15 @@ stop_timer(State, Idx) ->
                          _     -> setelement(Idx, State, undefined)
                      end
     end.
+
+store_proc_name(Type, ProcName) -> store_proc_name({Type, ProcName}).
+store_proc_name(TypeProcName)   -> put(process_name, TypeProcName).
+
+moving_average(_Time, _HalfLife, Next, undefined) ->
+    Next;
+moving_average(Time,  HalfLife,  Next, Current) ->
+    Weight = math:exp(Time * math:log(0.5) / HalfLife),
+    Next * (1 - Weight) + Current * Weight.
 
 %% -------------------------------------------------------------------------
 %% Begin copypasta from gen_server2.erl
