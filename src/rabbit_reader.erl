@@ -11,7 +11,7 @@
 %% The Original Code is RabbitMQ.
 %%
 %% The Initial Developer of the Original Code is GoPivotal, Inc.
-%% Copyright (c) 2007-2013 GoPivotal, Inc.  All rights reserved.
+%% Copyright (c) 2007-2014 GoPivotal, Inc.  All rights reserved.
 %%
 
 -module(rabbit_reader).
@@ -45,8 +45,7 @@
                      client_properties, capabilities,
                      auth_mechanism, auth_state}).
 
--record(throttle, {alarmed_by, last_blocked_by, last_blocked_at,
-                   blocked_sent}).
+-record(throttle, {alarmed_by, last_blocked_by, last_blocked_at}).
 
 -define(STATISTICS_KEYS, [pid, recv_oct, recv_cnt, send_oct, send_cnt,
                           send_pend, state, channels]).
@@ -189,8 +188,8 @@ server_capabilities(_) ->
 log(Level, Fmt, Args) -> rabbit_log:log(connection, Level, Fmt, Args).
 
 socket_error(Reason) ->
-    log(error, "error on AMQP connection ~p: ~p (~s)~n",
-        [self(), Reason, rabbit_misc:format_inet_error(Reason)]).
+    log(error, "error on AMQP connection ~p: ~s~n",
+        [self(), rabbit_misc:format_inet_error(Reason)]).
 
 inet_op(F) -> rabbit_misc:throw_on_error(inet_error, F).
 
@@ -248,8 +247,7 @@ start_connection(Parent, HelperSup, Deb, Sock, SockTransform) ->
                 throttle            = #throttle{
                                          alarmed_by      = [],
                                          last_blocked_by = none,
-                                         last_blocked_at = never,
-                                         blocked_sent    = false}},
+                                         last_blocked_at = never}},
     try
         run({?MODULE, recvloop,
              [Deb, [], 0, switch_callback(rabbit_event:init_stats_timer(
@@ -338,14 +336,19 @@ stop(Reason, State) -> maybe_emit_stats(State),
                        throw({inet_error, Reason}).
 
 handle_other({conserve_resources, Source, Conserve},
-             State = #v1{throttle = Throttle =
-                             #throttle{alarmed_by = CR}}) ->
+             State = #v1{throttle = Throttle = #throttle{alarmed_by = CR}}) ->
     CR1 = case Conserve of
               true  -> lists:usort([Source | CR]);
               false -> CR -- [Source]
           end,
-    Throttle1 = Throttle#throttle{alarmed_by = CR1},
-    control_throttle(State#v1{throttle = Throttle1});
+    State1 = control_throttle(
+               State#v1{throttle = Throttle#throttle{alarmed_by = CR1}}),
+    case {blocked_by_alarm(State), blocked_by_alarm(State1)} of
+        {false, true} -> ok = send_blocked(State1);
+        {true, false} -> ok = send_unblocked(State1);
+        {_,        _} -> ok
+    end,
+    State1;
 handle_other({channel_closing, ChPid}, State) ->
     ok = rabbit_channel:ready_for_close(ChPid),
     {_, State1} = channel_cleanup(ChPid, State),
@@ -438,10 +441,7 @@ control_throttle(State = #v1{connection_state = CS, throttle = Throttle}) ->
         {blocking, false} -> State#v1{connection_state = running};
         {blocked,  false} -> ok = rabbit_heartbeat:resume_monitor(
                                     State#v1.heartbeater),
-                             maybe_send_unblocked(State),
-                             State#v1{connection_state = running,
-                                      throttle = Throttle#throttle{
-                                                   blocked_sent = false}};
+                             State#v1{connection_state = running};
         {blocked,   true} -> State#v1{throttle = update_last_blocked_by(
                                                    Throttle)};
         {_,            _} -> State
@@ -450,37 +450,49 @@ control_throttle(State = #v1{connection_state = CS, throttle = Throttle}) ->
 maybe_block(State = #v1{connection_state = blocking,
                         throttle         = Throttle}) ->
     ok = rabbit_heartbeat:pause_monitor(State#v1.heartbeater),
-    Sent = maybe_send_blocked(State),
-    State#v1{connection_state = blocked,
-             throttle = update_last_blocked_by(
-                          Throttle#throttle{last_blocked_at = erlang:now(),
-                                            blocked_sent    = Sent})};
+    State1 = State#v1{connection_state = blocked,
+                      throttle = update_last_blocked_by(
+                                   Throttle#throttle{
+                                     last_blocked_at = erlang:now()})},
+    case {blocked_by_alarm(State), blocked_by_alarm(State1)} of
+        {false, true} -> ok = send_blocked(State1);
+        {_,        _} -> ok
+    end,
+    State1;
 maybe_block(State) ->
     State.
 
-maybe_send_blocked(#v1{throttle = #throttle{alarmed_by = []}}) ->
-    false;
-maybe_send_blocked(#v1{throttle   = #throttle{alarmed_by = CR},
-                       connection = #connection{
-                                       protocol     = Protocol,
-                                       capabilities = Capabilities},
-                       sock       = Sock}) ->
+
+blocked_by_alarm(#v1{connection_state = blocked,
+                     throttle         = #throttle{alarmed_by = CR}})
+  when CR =/= [] ->
+    true;
+blocked_by_alarm(#v1{}) ->
+    false.
+
+send_blocked(#v1{throttle   = #throttle{alarmed_by = CR},
+                 connection = #connection{protocol     = Protocol,
+                                          capabilities = Capabilities},
+                 sock       = Sock}) ->
     case rabbit_misc:table_lookup(Capabilities, <<"connection.blocked">>) of
         {bool, true} ->
             RStr = string:join([atom_to_list(A) || A <- CR], " & "),
             Reason = list_to_binary(rabbit_misc:format("low on ~s", [RStr])),
             ok = send_on_channel0(Sock, #'connection.blocked'{reason = Reason},
-                                  Protocol),
-            true;
+                                  Protocol);
         _ ->
-            false
+            ok
     end.
 
-maybe_send_unblocked(#v1{throttle = #throttle{blocked_sent = false}}) ->
-    ok;
-maybe_send_unblocked(#v1{connection = #connection{protocol = Protocol},
-                         sock       = Sock}) ->
-    ok = send_on_channel0(Sock, #'connection.unblocked'{}, Protocol).
+send_unblocked(#v1{connection = #connection{protocol     = Protocol,
+                                            capabilities = Capabilities},
+                   sock       = Sock}) ->
+    case rabbit_misc:table_lookup(Capabilities, <<"connection.blocked">>) of
+        {bool, true} ->
+            ok = send_on_channel0(Sock, #'connection.unblocked'{}, Protocol);
+        _ ->
+            ok
+    end.
 
 update_last_blocked_by(Throttle = #throttle{alarmed_by = []}) ->
     Throttle#throttle{last_blocked_by = flow};
@@ -1011,29 +1023,12 @@ auth_mechanisms_binary(Sock) ->
 auth_phase(Response,
            State = #v1{connection = Connection =
                            #connection{protocol       = Protocol,
-                                       capabilities   = Capabilities,
                                        auth_mechanism = {Name, AuthMechanism},
                                        auth_state     = AuthState},
                        sock = Sock}) ->
     case AuthMechanism:handle_response(Response, AuthState) of
         {refused, Msg, Args} ->
-            AmqpError = rabbit_misc:amqp_error(
-                          access_refused, "~s login refused: ~s",
-                          [Name, io_lib:format(Msg, Args)], none),
-            case rabbit_misc:table_lookup(Capabilities,
-                                          <<"authentication_failure_close">>) of
-                {bool, true} ->
-                    SafeMsg = io_lib:format(
-                                "Login was refused using authentication "
-                                "mechanism ~s. For details see the broker "
-                                "logfile.", [Name]),
-                    AmqpError1 = AmqpError#amqp_error{explanation = SafeMsg},
-                    {0, CloseMethod} = rabbit_binary_generator:map_exception(
-                                         0, AmqpError1, Protocol),
-                    ok = send_on_channel0(State#v1.sock, CloseMethod, Protocol);
-                _ -> ok
-            end,
-            rabbit_misc:protocol_error(AmqpError);
+            auth_fail(Msg, Args, Name, State);
         {protocol_error, Msg, Args} ->
             rabbit_misc:protocol_error(syntax_error, Msg, Args);
         {challenge, Challenge, AuthState1} ->
@@ -1041,7 +1036,12 @@ auth_phase(Response,
             ok = send_on_channel0(Sock, Secure, Protocol),
             State#v1{connection = Connection#connection{
                                     auth_state = AuthState1}};
-        {ok, User} ->
+        {ok, User = #user{username = Username}} ->
+            case rabbit_access_control:check_user_loopback(Username, Sock) of
+                ok          -> ok;
+                not_allowed -> auth_fail("user '~s' can only connect via "
+                                         "localhost", [Username], Name, State)
+            end,
             Tune = #'connection.tune'{frame_max   = get_env(frame_max),
                                       channel_max = get_env(channel_max),
                                       heartbeat   = get_env(heartbeat)},
@@ -1050,6 +1050,27 @@ auth_phase(Response,
                      connection = Connection#connection{user       = User,
                                                         auth_state = none}}
     end.
+
+auth_fail(Msg, Args, AuthName,
+          State = #v1{connection = #connection{protocol     = Protocol,
+                                               capabilities = Capabilities}}) ->
+    AmqpError = rabbit_misc:amqp_error(
+                  access_refused, "~s login refused: ~s",
+                  [AuthName, io_lib:format(Msg, Args)], none),
+    case rabbit_misc:table_lookup(Capabilities,
+                                  <<"authentication_failure_close">>) of
+        {bool, true} ->
+            SafeMsg = io_lib:format(
+                        "Login was refused using authentication "
+                        "mechanism ~s. For details see the broker "
+                        "logfile.", [AuthName]),
+            AmqpError1 = AmqpError#amqp_error{explanation = SafeMsg},
+            {0, CloseMethod} = rabbit_binary_generator:map_exception(
+                                 0, AmqpError1, Protocol),
+            ok = send_on_channel0(State#v1.sock, CloseMethod, Protocol);
+        _ -> ok
+    end,
+    rabbit_misc:protocol_error(AmqpError).
 
 %%--------------------------------------------------------------------------
 
@@ -1073,12 +1094,16 @@ i(peer_cert_subject,  S) -> cert_info(fun rabbit_ssl:peer_cert_subject/1,  S);
 i(peer_cert_validity, S) -> cert_info(fun rabbit_ssl:peer_cert_validity/1, S);
 i(channels,           #v1{channel_count = ChannelCount}) -> ChannelCount;
 i(state, #v1{connection_state = ConnectionState,
-             throttle         = #throttle{last_blocked_by  = BlockedBy,
-                                          last_blocked_at  = T}}) ->
-    Recent = T =/= never andalso timer:now_diff(erlang:now(), T) < 5000000,
-    case {BlockedBy, Recent} of
-        {flow, true} -> flow;
-        {_,    _}    -> ConnectionState
+             throttle         = #throttle{alarmed_by      = Alarms,
+                                          last_blocked_by = WasBlockedBy,
+                                          last_blocked_at = T}}) ->
+    case Alarms =:= [] andalso %% not throttled by resource alarms
+        (credit_flow:blocked() %% throttled by flow now
+         orelse                %% throttled by flow recently
+           (WasBlockedBy =:= flow andalso T =/= never andalso
+            timer:now_diff(erlang:now(), T) < 5000000)) of
+        true  -> flow;
+        false -> ConnectionState
     end;
 i(Item,               #v1{connection = Conn}) -> ic(Item, Conn).
 
@@ -1158,7 +1183,7 @@ become_1_0(Id, State = #v1{sock = Sock}) ->
                              {rabbit_amqp1_0_reader, init,
                               [Mode, pack_for_1_0(Buf, BufLen, S)]}
                      end,
-                 State = #v1{connection_state = {become, F}}
+                 State#v1{connection_state = {become, F}}
     end.
 
 pack_for_1_0(Buf, BufLen, #v1{parent       = Parent,

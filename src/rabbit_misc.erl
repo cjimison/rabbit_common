@@ -11,7 +11,7 @@
 %% The Original Code is RabbitMQ.
 %%
 %% The Initial Developer of the Original Code is GoPivotal, Inc.
-%% Copyright (c) 2007-2013 GoPivotal, Inc.  All rights reserved.
+%% Copyright (c) 2007-2014 GoPivotal, Inc.  All rights reserved.
 %%
 
 -module(rabbit_misc).
@@ -51,7 +51,6 @@
 -export([dict_cons/3, orddict_cons/3, gb_trees_cons/3]).
 -export([gb_trees_fold/3, gb_trees_foreach/2]).
 -export([parse_arguments/3]).
--export([all_module_attributes_with_app/1]).
 -export([all_module_attributes/1, build_acyclic_graph/3]).
 -export([now_ms/0]).
 -export([const/1]).
@@ -211,8 +210,6 @@
         -> {'ok', {atom(), [{string(), string()}], [string()]}} |
            'no_command').
 -spec(all_module_attributes/1 :: (atom()) -> [{atom(), [term()]}]).
--spec(all_module_attributes_with_app/1 ::
-        (atom()) -> [{atom(), atom(), [term()]}]).
 -spec(build_acyclic_graph/3 ::
         (graph_vertex_fun(), graph_edge_fun(), [{atom(), [term()]}])
         -> rabbit_types:ok_or_error2(digraph(),
@@ -545,9 +542,11 @@ tcp_name(Prefix, IPAddress, Port)
     list_to_atom(
       format("~w_~s:~w", [Prefix, inet_parse:ntoa(IPAddress), Port])).
 
-format_inet_error(address) -> "cannot connect to host/port";
-format_inet_error(timeout) -> "timed out";
-format_inet_error(Error)   -> inet:format_error(Error).
+format_inet_error(E) -> format("~w (~s)", [E, format_inet_error0(E)]).
+
+format_inet_error0(address) -> "cannot connect to host/port";
+format_inet_error0(timeout) -> "timed out";
+format_inet_error0(Error)   -> inet:format_error(Error).
 
 %% This is a modified version of Luke Gorrie's pmap -
 %% http://lukego.livejournal.com/6753.html - that doesn't care about
@@ -688,7 +687,7 @@ pid_to_string(Pid) when is_pid(Pid) ->
     <<131,103,100,NodeLen:16,NodeBin:NodeLen/binary,Id:32,Ser:32,Cre:8>>
         = term_to_binary(Pid),
     Node = binary_to_term(<<131,100,NodeLen:16,NodeBin:NodeLen/binary>>),
-    format("<~w.~B.~B.~B>", [Node, Cre, Id, Ser]).
+    format("<~s.~B.~B.~B>", [Node, Cre, Id, Ser]).
 
 %% inverse of above
 string_to_pid(Str) ->
@@ -698,13 +697,7 @@ string_to_pid(Str) ->
     case re:run(Str, "^<(.*)\\.(\\d+)\\.(\\d+)\\.(\\d+)>\$",
                 [{capture,all_but_first,list}]) of
         {match, [NodeStr, CreStr, IdStr, SerStr]} ->
-            %% the NodeStr atom might be quoted, so we have to parse
-            %% it rather than doing a simple list_to_atom
-            NodeAtom = case erl_scan:string(NodeStr) of
-                           {ok, [{atom, _, X}], _} -> X;
-                           {error, _, _} -> throw(Err)
-                       end,
-            <<131,NodeEnc/binary>> = term_to_binary(NodeAtom),
+            <<131,NodeEnc/binary>> = term_to_binary(list_to_atom(NodeStr)),
             [Cre, Id, Ser] = lists:map(fun list_to_integer/1,
                                        [CreStr, IdStr, SerStr]),
             binary_to_term(<<131,103,NodeEnc/binary,Id:32,Ser:32,Cre:8>>);
@@ -855,38 +848,21 @@ module_attributes(Module) ->
             V
     end.
 
-all_module_attributes_with_app(Name) ->
-    find_module_attributes(
-      fun(App, Modules) ->
-            [{App, Module} || Module <- Modules]
-      end,
-      fun ({App, Module}, Acc) ->
-              case lists:append([Atts || {N, Atts} <- module_attributes(Module),
-                                         N =:= Name]) of
-                  []   -> Acc;
-                  Atts -> [{App, Module, Atts} | Acc]
-              end
-      end).
-
 all_module_attributes(Name) ->
-    find_module_attributes(
-      fun(_App, Modules) -> Modules end,
+    Modules =
+        lists:usort(
+          lists:append(
+            [Modules || {App, _, _}   <- application:loaded_applications(),
+                        {ok, Modules} <- [application:get_key(App, modules)]])),
+    lists:foldl(
       fun (Module, Acc) ->
               case lists:append([Atts || {N, Atts} <- module_attributes(Module),
                                          N =:= Name]) of
                   []   -> Acc;
                   Atts -> [{Module, Atts} | Acc]
               end
-      end).
+      end, [], Modules).
 
-find_module_attributes(Generator, Fold) ->
-    Targets =
-        lists:usort(
-          lists:append(
-            [Generator(App, Modules) ||
-                {App, _, _}   <- application:loaded_applications(),
-                {ok, Modules} <- [application:get_key(App, modules)]])),
-    lists:foldl(Fold, [], Targets).
 
 build_acyclic_graph(VertexFun, EdgeFun, Graph) ->
     G = digraph:new([acyclic]),

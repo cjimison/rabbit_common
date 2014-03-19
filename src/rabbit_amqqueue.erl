@@ -11,7 +11,7 @@
 %% The Original Code is RabbitMQ.
 %%
 %% The Initial Developer of the Original Code is GoPivotal, Inc.
-%% Copyright (c) 2007-2013 GoPivotal, Inc.  All rights reserved.
+%% Copyright (c) 2007-2014 GoPivotal, Inc.  All rights reserved.
 %%
 
 -module(rabbit_amqqueue).
@@ -26,7 +26,7 @@
 -export([list/0, list/1, info_keys/0, info/1, info/2, info_all/1, info_all/2]).
 -export([force_event_refresh/1, notify_policy_changed/1]).
 -export([consumers/1, consumers_all/1, consumer_info_keys/0]).
--export([basic_get/4, basic_consume/9, basic_cancel/4, notify_decorators/1]).
+-export([basic_get/4, basic_consume/10, basic_cancel/4, notify_decorators/1]).
 -export([notify_sent/2, notify_sent_queue_down/1, resume/2]).
 -export([notify_down_all/2, activate_limit_all/2, credit/5]).
 -export([on_node_down/1]).
@@ -114,11 +114,12 @@
 -spec(notify_policy_changed/1 :: (rabbit_types:amqqueue()) -> 'ok').
 -spec(consumers/1 :: (rabbit_types:amqqueue())
                      -> [{pid(), rabbit_types:ctag(), boolean(),
-                          rabbit_framing:amqp_table()}]).
+                          non_neg_integer(), rabbit_framing:amqp_table()}]).
 -spec(consumer_info_keys/0 :: () -> rabbit_types:info_keys()).
 -spec(consumers_all/1 ::
         (rabbit_types:vhost())
-        -> [{name(), pid(), rabbit_types:ctag(), boolean()}]).
+        -> [{name(), pid(), rabbit_types:ctag(), boolean(),
+             non_neg_integer(), rabbit_framing:amqp_table()}]).
 -spec(stat/1 ::
         (rabbit_types:amqqueue())
         -> {'ok', non_neg_integer(), non_neg_integer()}).
@@ -149,9 +150,10 @@
                           {'ok', non_neg_integer(), qmsg()} | 'empty').
 -spec(credit/5 :: (rabbit_types:amqqueue(), pid(), rabbit_types:ctag(),
                    non_neg_integer(), boolean()) -> 'ok').
--spec(basic_consume/9 ::
+-spec(basic_consume/10 ::
         (rabbit_types:amqqueue(), boolean(), pid(), pid(), boolean(),
-         rabbit_types:ctag(), boolean(), rabbit_framing:amqp_table(), any())
+         non_neg_integer(), rabbit_types:ctag(), boolean(),
+         rabbit_framing:amqp_table(), any())
         -> rabbit_types:ok_or_error('exclusive_consume_unavailable')).
 -spec(basic_cancel/4 ::
         (rabbit_types:amqqueue(), pid(), rabbit_types:ctag(), any()) -> 'ok').
@@ -184,7 +186,8 @@
 %%----------------------------------------------------------------------------
 
 -define(CONSUMER_INFO_KEYS,
-        [queue_name, channel_pid, consumer_tag, ack_required, arguments]).
+        [queue_name, channel_pid, consumer_tag, ack_required, prefetch_count,
+         arguments]).
 
 recover() ->
     %% Clear out remnants of old incarnation, in case we restarted
@@ -221,36 +224,37 @@ start(Qs) ->
 
 find_durable_queues() ->
     Node = node(),
-    %% TODO: use dirty ops instead
-    rabbit_misc:execute_mnesia_transaction(
+    mnesia:async_dirty(
       fun () ->
               qlc:e(qlc:q([Q || Q = #amqqueue{name = Name,
                                               pid  = Pid}
                                     <- mnesia:table(rabbit_durable_queue),
-                                mnesia:read(rabbit_queue, Name, read) =:= [],
-                                node(Pid) == Node]))
+                                node(Pid) == Node,
+                                mnesia:read(rabbit_queue, Name, read) =:= []]))
       end).
 
 recover_durable_queues(QueuesAndRecoveryTerms) ->
-    Qs = [{start_queue_process(node(), Q), Terms} ||
-             {Q, Terms} <- QueuesAndRecoveryTerms],
-    [Q || {Q = #amqqueue{ pid = Pid }, Terms} <- Qs,
-          gen_server2:call(Pid, {init, {self(), Terms}}, infinity) == {new, Q}].
+    {Results, Failures} =
+        gen_server2:mcall([{start_queue_process(node(), Q),
+                            {init, {self(), Terms}}} ||
+                              {Q, Terms} <- QueuesAndRecoveryTerms]),
+    [rabbit_log:error("Queue ~p failed to initialise: ~p~n",
+                      [Pid, Error]) || {Pid, Error} <- Failures],
+    [Q || {_, {new, Q}} <- Results].
 
 declare(QueueName, Durable, AutoDelete, Args, Owner) ->
     ok = check_declare_arguments(QueueName, Args),
-    Q0 = rabbit_policy:set(#amqqueue{name            = QueueName,
-                                     durable         = Durable,
-                                     auto_delete     = AutoDelete,
-                                     arguments       = Args,
-                                     exclusive_owner = Owner,
-                                     pid             = none,
-                                     slave_pids      = [],
-                                     sync_slave_pids = [],
-                                     gm_pids         = []}),
-    {Node, _MNodes} = rabbit_mirror_queue_misc:suggested_queue_nodes(Q0),
-    Q1 = start_queue_process(Node, Q0),
-    gen_server2:call(Q1#amqqueue.pid, {init, new}, infinity).
+    Q = rabbit_policy:set(#amqqueue{name            = QueueName,
+                                    durable         = Durable,
+                                    auto_delete     = AutoDelete,
+                                    arguments       = Args,
+                                    exclusive_owner = Owner,
+                                    pid             = none,
+                                    slave_pids      = [],
+                                    sync_slave_pids = [],
+                                    gm_pids         = []}),
+    {Node, _MNodes} = rabbit_mirror_queue_misc:suggested_queue_nodes(Q),
+    gen_server2:call(start_queue_process(Node, Q), {init, new}, infinity).
 
 internal_declare(Q, true) ->
     rabbit_misc:execute_mnesia_tx_with_tail(
@@ -313,7 +317,7 @@ policy_changed(Q1 = #amqqueue{decorators = Decorators1},
 
 start_queue_process(Node, Q) ->
     {ok, Pid} = rabbit_amqqueue_sup:start_child(Node, [Q]),
-    Q#amqqueue{pid = Pid}.
+    Pid.
 
 add_default_binding(#amqqueue{name = QueueName}) ->
     ExchangeName = rabbit_misc:r(QueueName, exchange, <<>>),
@@ -530,9 +534,10 @@ consumers_all(VHostPath) ->
     lists:append(
       map(VHostPath,
           fun (Q) ->
-              [lists:zip(ConsumerInfoKeys,
-                         [Q#amqqueue.name, ChPid, CTag, AckRequired, Args]) ||
-                         {ChPid, CTag, AckRequired, Args} <- consumers(Q)]
+              [lists:zip(
+                 ConsumerInfoKeys,
+                 [Q#amqqueue.name, ChPid, CTag, AckRequired, Prefetch, Args]) ||
+                  {ChPid, CTag, AckRequired, Prefetch, Args} <- consumers(Q)]
           end)).
 
 stat(#amqqueue{pid = QPid}) -> delegate:call(QPid, stat).
@@ -577,10 +582,12 @@ basic_get(#amqqueue{pid = QPid}, ChPid, NoAck, LimiterPid) ->
     delegate:call(QPid, {basic_get, ChPid, NoAck, LimiterPid}).
 
 basic_consume(#amqqueue{pid = QPid, name = QName}, NoAck, ChPid, LimiterPid,
-              LimiterActive, ConsumerTag, ExclusiveConsume, Args, OkMsg) ->
+              LimiterActive, ConsumerPrefetchCount, ConsumerTag,
+              ExclusiveConsume, Args, OkMsg) ->
     ok = check_consume_arguments(QName, Args),
     delegate:call(QPid, {basic_consume, NoAck, ChPid, LimiterPid, LimiterActive,
-                         ConsumerTag, ExclusiveConsume, Args, OkMsg}).
+                         ConsumerPrefetchCount, ConsumerTag, ExclusiveConsume,
+                         Args, OkMsg}).
 
 basic_cancel(#amqqueue{pid = QPid}, ChPid, ConsumerTag, OkMsg) ->
     delegate:call(QPid, {basic_cancel, ChPid, ConsumerTag, OkMsg}).

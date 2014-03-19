@@ -11,13 +11,13 @@
 %% The Original Code is RabbitMQ.
 %%
 %% The Initial Developer of the Original Code is GoPivotal, Inc.
-%% Copyright (c) 2007-2013 GoPivotal, Inc.  All rights reserved.
+%% Copyright (c) 2007-2014 GoPivotal, Inc.  All rights reserved.
 %%
 -module(app_utils).
 
 -export([load_applications/1, start_applications/1, start_applications/2,
          stop_applications/1, stop_applications/2, app_dependency_order/2,
-         wait_for_applications/1, app_dependencies/1]).
+         wait_for_applications/1]).
 
 -ifdef(use_specs).
 
@@ -30,7 +30,6 @@
 -spec stop_applications([atom()], error_handler())  -> 'ok'.
 -spec wait_for_applications([atom()])               -> 'ok'.
 -spec app_dependency_order([atom()], boolean())     -> [digraph:vertex()].
--spec app_dependencies(atom())                      -> [atom()].
 
 -endif.
 
@@ -69,6 +68,7 @@ stop_applications(Apps, ErrorHandler) ->
                         ErrorHandler,
                         Apps).
 
+
 wait_for_applications(Apps) ->
     [wait_for_application(App) || App <- Apps], ok.
 
@@ -80,9 +80,8 @@ app_dependency_order(RootApps, StripUnreachable) ->
                     {App, _Desc, _Vsn} <- application:loaded_applications()]),
     try
         case StripUnreachable of
-            true  -> digraph:del_vertices(
-                       G, digraph:vertices(G) --
-                           digraph_utils:reachable(RootApps, G));
+            true -> digraph:del_vertices(G, digraph:vertices(G) --
+                     digraph_utils:reachable(RootApps, G));
             false -> ok
         end,
         digraph_utils:topsort(G)
