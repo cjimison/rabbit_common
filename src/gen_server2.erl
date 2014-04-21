@@ -1128,6 +1128,8 @@ terminate(Reason, Msg, #gs2_state { name  = Name,
                     exit(shutdown);
                 {shutdown,_}=Shutdown ->
                     exit(Shutdown);
+                {error, {consumer_died, normal}} ->
+                    exit(normal);
                 _ ->
                     error_info(Reason, undefined, Name, Msg, State, Debug),
                     exit(Reason)
